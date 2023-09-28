@@ -1,99 +1,120 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net.NetworkInformation;
 using System.Xml;
 using System.Threading;
 using System.Diagnostics;
-using System.Xml.Linq;
 
 namespace TestDostupnostiIP
 {
     public class Tester
     {
-        private const int timeout = 300;
         private const int perioda = 100;
         private readonly string soubor = "testy.xml";
         private readonly object zamek = new object();
+        private int aktivniVlakno;
+        private List<Test> provedeneTesty = new List<Test>();
 
         public void Testuj(string parametr)
         {
             string[] casti = parametr.Split(new char[] { ' ' });
             TimeSpan dobaTrvani = TimeSpan.FromSeconds(Convert.ToInt32(casti[0]));
 
-            VytvorXmlDok();
+            aktivniVlakno = 0;
 
             int pocet = casti.Length - 1;
-            Thread[] vlakna = new Thread[pocet];
             for (int i = 1; i <= pocet; i++)
             {
+                ++aktivniVlakno;
                 string adresa = casti[i];
-                int vlakno = i - 1;
-                vlakna[vlakno] = new Thread(
+                Thread vlakno = new Thread(
                     () =>
                     {
-                        PosliZapis(adresa, dobaTrvani);
+                        ProvedTest(adresa, dobaTrvani);
                     });
-                vlakna[vlakno].Start();
+                vlakno.Start();
             }
 
-            while (vlakna.Any(a => a.IsAlive))
-            {
-                Thread.Sleep(2000);
-            }
-            ProjdiXml(soubor);
-        }
-        // --------------------------------------
-
-        private void PosliZapis(string adresa, TimeSpan dobaTrvani)
-        {
-            Stopwatch stopky = new Stopwatch();
-            stopky.Start();
-            while (stopky.Elapsed <= dobaTrvani)
-            {
-                bool dostupna = JeAdresaDostupna(adresa);
-                lock (zamek)
+            Thread writer = new Thread(
+                () =>
                 {
-                    PridejDoXml(adresa, dostupna);
-                }
-                Thread.Sleep(perioda);
+                    ZapisDoXml();
+                });
+            writer.Start();
+            writer.Join();
+
+            ProjdiXml();
+        }
+        // --------------------------------------
+
+        private void ProvedTest(string adresa, TimeSpan dobaTrvani)
+        {
+            AutoResetEvent resetEvent = new AutoResetEvent(false); 
+            Timer timer = new Timer(TimerEvent, adresa, 0, perioda);
+            resetEvent.WaitOne(dobaTrvani);
+            timer.Dispose();
+            lock (zamek)
+            {
+                --aktivniVlakno;
             }
-            stopky.Stop();
         }
         // --------------------------------------
 
-        private bool JeAdresaDostupna(string adresa)
+        private void TimerEvent(object state)
         {
-            Ping tester = new Ping();
-            PingReply odpoved = tester.Send(adresa, timeout);
-            bool dostupna = odpoved.Status == IPStatus.Success;
-            tester.Dispose();
-            return dostupna;
+            string adresa = state.ToString();
+            bool dostupna = Test.JeAdresaDostupna(adresa);
+            lock (provedeneTesty)
+            {
+                provedeneTesty.Add(new Test(adresa, dostupna));
+            }
         }
         // --------------------------------------
 
-        private void VytvorXmlDok()
+        public void ZapisDoXml()
         {
-            XDocument xml = new XDocument();
-            xml.Add(new XElement("testy"));
-            xml.Save(soubor);
+            int pocetTestu;
+            lock (provedeneTesty)
+            {
+                pocetTestu = provedeneTesty.Count;
+            }
+
+            XmlWriterSettings settings = new XmlWriterSettings()
+            {
+                Indent = true
+            };
+
+            using (XmlWriter writer = XmlWriter.Create(soubor, settings))
+            {
+                writer.WriteStartElement("testy");
+                while (aktivniVlakno + pocetTestu > 0)
+                {
+                    if (pocetTestu > 0)
+                    {
+                        lock (provedeneTesty)
+                        {
+                            Test test = provedeneTesty.First();
+                            writer.WriteStartElement("test");
+                            writer.WriteAttributeString("adresa", test.Adresa);
+                            writer.WriteStartElement("dostupnost");
+                            writer.WriteValue(test.Dostupnost);
+                            writer.WriteEndElement();
+                            writer.WriteEndElement();
+                            writer.Flush();
+                            provedeneTesty.RemoveAt(0);
+                        }
+                    }
+                    lock (provedeneTesty)
+                    {
+                        pocetTestu = provedeneTesty.Count;
+                    }
+                }
+                writer.WriteEndElement();
+            }
         }
         // --------------------------------------
 
-        private void PridejDoXml(string adresa, bool dostupna)
-        {
-            XDocument xml = XDocument.Load(soubor);
-            XElement el = xml.Element("testy");
-
-            el.Add(new XElement("test",
-                new XAttribute("adresa", adresa),
-                new XElement("dostupnost", dostupna)));
-
-            xml.Save(soubor);
-        }
-        // --------------------------------------
-
-        private void ProjdiXml(string soubor)
+        private void ProjdiXml()
         {
             Dictionary<string, List<bool>> adresa2ping = Adresa2ping(soubor);
 
